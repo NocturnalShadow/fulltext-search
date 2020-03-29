@@ -1,26 +1,61 @@
 package main
 
 import (
-	"encoding/gob"
+	"bytes"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
+	"sort"
+	"strconv"
 
 	"code.sajari.com/docconv"
-	mapset "github.com/deckarep/golang-set"
-	bitset "github.com/willf/bitset"
+	"github.com/lunixbochs/struc"
 	"gopkg.in/jdkato/prose.v2"
 )
 
 var punctuation = []string{".", "!", "?", ":", ";", ",", "(", ")", "—", "·"}
 
-// InvIndex - mapping from tokens to all the document names it occurs in
-type InvIndex map[string]mapset.Set
+// Build large index on Disk
+// Struct for index entry - X
+// Build terms dictionary - X
+// Build docs dictionary - X
+// Block of indexes - sort by term ID
+// Swap block on disk
+// Start another block
+// Write all blocks on disk
+// Merge blocks in one index
 
-// IncMatrix - incidence matrix of tokens and documents
-type IncMatrix map[string]bitset.BitSet
+// Terms - mapping from term to term ID
+type Terms map[string]int32
+
+// Docs - mapping from doc to doc ID
+type Docs map[string]int32
+
+// Record - processing record
+type Record struct {
+	TermID int32
+	DocID  int32
+}
+
+// InvIndexEntry - entry to the inverted index
+type InvIndexEntry struct {
+	TermID       int32
+	Size         int32 `struc:"sizeof=InvertedList"`
+	InvertedList []int32
+}
+
+// InvIndexShard - a small block of term-documents inverted indices
+type InvIndexShard struct {
+	Size  int32 `struc:"sizeof=Terms"`
+	Terms []InvIndexEntry
+}
+
+// InvIndex - terms documents inverted index
+type InvIndex struct {
+	Size   int32 `struc:"sizeof=Shards"`
+	Shards []InvIndexShard
+}
 
 // IsIn - checks if the value is in a slice
 func IsIn(slice []string, val string) bool {
@@ -33,253 +68,217 @@ func IsIn(slice []string, val string) bool {
 }
 
 // CreateInvIndex - Create inverse index of words for text files in a directory
-func CreateInvIndex(dir string) (InvIndex, mapset.Set) {
-	invIndex := make(InvIndex)
+func CreateInvIndex(filesDir string) {
+	i := 0
+	blockID := 0
+	blockSize := 100000
+	shardSize := 1000
+	terms := make(Terms)
+	docs := make(Docs)
+	recordsBlock := make([]Record, blockSize)
 
-	files, err := filepath.Glob(dir + "/*") // ioutil.ReadDir("./texts/")
+	// Build inverted index blocks
+	files, err := filepath.Glob(filesDir + "/*")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	log.Printf("Indexing %v documents.", len(files))
 
-	fullSet := mapset.NewSet()
 	for _, file := range files {
-		fullSet.Add(file)
+		docID := int32(len(docs))
+		docs[file] = docID // assign document and ID
 
-		res, err := docconv.ConvertPath(file)
+		res, err := docconv.ConvertPath(file) // get document handler
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		doc, err := prose.NewDocument(res.Body, prose.WithExtraction(false), prose.WithTagging(false))
+		doc, err := prose.NewDocument(res.Body, prose.WithExtraction(false), prose.WithTagging(false)) // read document
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		log.Printf("%v: Found %v tokens.", file, len(doc.Tokens()))
-		// Iterate over the doc's tokens:
+
 		for _, token := range doc.Tokens() {
 			if !IsIn(punctuation, token.Text) {
-				if _, ok := invIndex[token.Text]; !ok {
-					invIndex[token.Text] = mapset.NewSet()
+				if _, ok := terms[token.Text]; !ok {
+					terms[token.Text] = int32(len(terms)) // Assign term and ID
 				}
 
-				invIndex[token.Text].Add(file)
+				termID := terms[token.Text]
+				recordsBlock[i] = Record{
+					TermID: termID,
+					DocID:  docID,
+				}
+
+				if i < blockSize-1 {
+					i++
+				} else { // Current block is done - write on disk and start a new block
+					// Sort block records
+					sort.Slice(recordsBlock[0:i], func(i, j int) bool {
+						return recordsBlock[i].TermID < recordsBlock[j].TermID
+					})
+
+					// Create inverted index for each term and write on disk sharded
+					shards := make([]InvIndexShard, 1, 100)
+					currentTermID := int32(-1)
+					var currentShard *InvIndexShard = &shards[0]
+					var currentEntry *InvIndexEntry
+
+					for _, entry := range recordsBlock {
+						if entry.TermID != currentTermID { // New term encoutered - start a new inverted index entry
+							if len(currentShard.Terms) == shardSize { // Current shard is done - start a new shard
+								shards = append(shards, InvIndexShard{})
+								currentShard = &shards[len(shards)-1]
+							}
+
+							currentTermID = entry.TermID
+
+							currentShard.Size++
+							currentShard.Terms = append(currentShard.Terms,
+								InvIndexEntry{ // Start a new index entry
+									TermID:       currentTermID,
+									Size:         0,
+									InvertedList: make([]int32, 0, 100),
+								})
+
+							currentEntry = &currentShard.Terms[currentShard.Size-1]
+						}
+
+						currentEntry.Size++
+						currentEntry.InvertedList = append(currentEntry.InvertedList, entry.DocID)
+					}
+
+					fileWritter, err := os.Create("index/block-" + strconv.Itoa(blockID) + ".bin")
+					if err != nil {
+						panic(err)
+					}
+
+					defer fileWritter.Close()
+
+					var buf bytes.Buffer
+
+					shardsCount := int32(len(shards))
+					err = struc.Pack(&buf, &shardsCount)
+					if err != nil {
+						fmt.Println("Packing failed:", err)
+					}
+
+					buf.WriteTo(fileWritter)
+
+					for _, shard := range shards {
+						err = struc.Pack(&buf, &shard)
+						if err != nil {
+							fmt.Println("Packing failed:", err)
+						}
+
+						buf.WriteTo(fileWritter)
+					}
+
+					blockID++
+					i = 0
+				}
 			}
 		}
 	}
 
-	return invIndex, fullSet
-}
+	// fmt.Printf("%v", recordsBlock)
 
-// CreateIncMatrix - Create incidence matrix of words for text files in a directory
-func CreateIncMatrix(dir string) (IncMatrix, []string) {
-	files, err := filepath.Glob(dir + "/*") // ioutil.ReadDir("./texts/")
+	// Merge blocks into one index file
+	files, err = filepath.Glob(dir + "/*")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("Indexing %v documents.", len(files))
-
-	docNames := make([]string, len(files))
-	incMatrix := make(IncMatrix)
-
-	for i, file := range files {
-		docNames[i] = file
-
-		// os.Stats(f)
-		res, err := docconv.ConvertPath(file)
+	var buf bytes.Buffer
+	var blockReaders []*os.File
+	var blockSizes []int32
+	for _, file := range files {
+		reader, err := os.Open(file)
 		if err != nil {
-			log.Fatal(err)
+			fmt.Println("Unpacking failed:", err)
 		}
 
-		doc, err := prose.NewDocument(res.Body, prose.WithExtraction(false), prose.WithTagging(false))
+		var size int32
+		buf.Reset()
+		buf.ReadFrom(reader)
+		err = struc.Unpack(&buf, &size)
 		if err != nil {
-			log.Fatal(err)
+			fmt.Println("Unpacking failed:", err)
 		}
 
-		log.Printf("%v: Found %v tokens.", file, len(doc.Tokens()))
+		blockReaders = append(blockReaders, reader)
+		blockSizes = append(blockSizes, size)
+	}
 
-		for _, token := range doc.Tokens() {
-			if !IsIn(punctuation, token.Text) {
-				vec := incMatrix[token.Text]
-				incMatrix[token.Text] = *vec.Set(uint(i))
+	findexWritter, err := os.Create("index/inv-index.bin")
+	if err != nil {
+		panic(err)
+	}
+
+	defer findexWritter.Close()
+
+	blocksCount := len(blockReaders)                  // number of blocks
+	blockShards := make([]InvIndexShard, blocksCount) // currently processed shards for each block
+	blockShardIndex := make([]int32, blocksCount)     // currently processed entry in a shard
+
+	var indexShard InvIndexShard
+	for {
+		minTermID := int32(-1)
+		for i, shard := range blockShards {
+			if blockShardIndex[i] == shard.Size {
+				if blockSizes[i] > 0 {
+					blockSizes[i]--
+					buf.Reset()
+					buf.ReadFrom(blockReaders[i])
+					err := struc.Unpack(&buf, &blockShards[i])
+					if err != nil {
+						fmt.Println("Unpacking failed:", err)
+					}
+				} else {
+					continue
+				}
+			}
+
+			if shard.Terms[blockShardIndex[i]].TermID < minTermID {
+				minTermID = shard.Terms[blockShardIndex[i]].TermID
 			}
 		}
+
+		if minTermID == int32(-1) {
+			break
+		}
+
+		indexShard.Terms = append(indexShard.Terms, InvIndexEntry{
+			TermID:       minTermID,
+			Size:         0,
+			InvertedList: make([]int32, 0, 100),
+		})
+
+		term := &indexShard.Terms[len(indexShard.Terms)-1]
+
+		for i, shard := range blockShards {
+			if shard.Terms[i].TermID == minTermID {
+				blockShardIndex[i]++
+				term.InvertedList = append(term.InvertedList, shard.Terms[i].InvertedList...)
+			}
+		}
+
+		term.Size = int32(len(term.InvertedList))
+
+		if len(indexShard.Terms) == shardSize {
+			buf.Reset()
+			err = struc.Pack(&buf, &indexShard)
+			if err != nil {
+				fmt.Println("Packing failed:", err)
+			}
+			buf.WriteTo(findexWritter)
+		}
 	}
-
-	return incMatrix, docNames
-}
-
-// Count - returns the number of entries in InvIndex
-func (invIndex InvIndex) Count() int { return len(invIndex) }
-
-// Find - searches for the given token in an inverse index
-func (invIndex InvIndex) Find(token string) []string {
-	index := invIndex[token]
-	entries := make([]string, index.Cardinality())
-	i := 0
-	for doc := range index.Iter() {
-		entries[i] = doc.(string)
-		i++
-	}
-
-	return entries
-}
-
-// Find - searches for the given token in an inverse index
-func (incMatrix IncMatrix) Find(token string, docNames []string) []string {
-	vec := incMatrix[token]
-	entries := make([]string, vec.Count())
-	i := 0
-	for bit, set := vec.NextSet(0); set; bit, set = vec.NextSet(bit + 1) {
-		entries[i] = docNames[bit]
-		i++
-	}
-
-	return entries
-}
-
-// Save - save index to file on disk
-func (invIndex InvIndex) Save(file string) {
-	encodeFile, err := os.Create(file)
-	if err != nil {
-		panic(err)
-	}
-
-	encoder := gob.NewEncoder(encodeFile)
-
-	if err := encoder.Encode(invIndex); err != nil {
-		panic(err)
-	}
-	encodeFile.Close()
-}
-
-// Load - load index from file on disk
-func Load(file string) InvIndex {
-	// Open a RO file
-	decodeFile, err := os.Open(file)
-	if err != nil {
-		panic(err)
-	}
-	defer decodeFile.Close()
-
-	decoder := gob.NewDecoder(decodeFile)
-
-	invIndex := make(InvIndex)
-
-	decoder.Decode(&invIndex)
-
-	return invIndex
-}
-
-// Vals - converts token to incidence bitset
-func (incMatrix IncMatrix) Vals(t string) (result bitset.BitSet) {
-	if set, ok := incMatrix[t]; ok {
-		return set
-	}
-
-	return
-}
-
-// And - logical AND
-func And(t1 bitset.BitSet, t2 bitset.BitSet) bitset.BitSet {
-	return *t1.Intersection(&t2)
-}
-
-// Or - logical OR
-func Or(t1 bitset.BitSet, t2 bitset.BitSet) bitset.BitSet {
-	return *t1.Union(&t2)
-}
-
-// Not - logical NOT
-func Not(t bitset.BitSet) bitset.BitSet {
-	return *t.Complement()
-}
-
-// IncToDocuments - translates incidence bitset to document names
-func IncToDocuments(vec bitset.BitSet, docNames []string) []string {
-	entries := make([]string, vec.Count())
-	i := 0
-	for bit, set := vec.NextSet(0); set; bit, set = vec.NextSet(bit + 1) {
-		entries[i] = docNames[bit]
-		i++
-	}
-
-	return entries
-}
-
-// IndToDocuments - translates index to document names
-func IndToDocuments(ind mapset.Set) []string {
-	entries := make([]string, ind.Cardinality())
-	i := 0
-	for doc := range ind.Iter() {
-		entries[i] = doc.(string)
-		i++
-	}
-
-	return entries
-}
-
-// Vals - converts token to inverted index
-func (invIndex InvIndex) Vals(t string) (result mapset.Set) {
-	if set, ok := invIndex[t]; ok {
-		return set
-	}
-
-	return
-}
-
-// And2 - logical AND
-func And2(t1 mapset.Set, t2 mapset.Set) mapset.Set {
-	return t1.Intersect(t2)
-}
-
-// Or2 - logical OR
-func Or2(t1 mapset.Set, t2 mapset.Set) mapset.Set {
-	return t1.Union(t2)
-}
-
-// Not2 - logical NOT
-func Not2(t mapset.Set, full mapset.Set) mapset.Set {
-	return full.Difference(t)
 }
 
 func main() {
-	// invIndexFile := "inv-index.gob"
-	// CreateInvIndex("./texts").Save(invIndexFile)
-	// invIndex := Load(invIndexFile)
-
-	invIndex, fullSet := CreateInvIndex("./texts")
-	incMatrix, docNames := CreateIncMatrix("./texts")
-
-	fmt.Println("Unique tokens count:", invIndex.Count())
-
-	// ==================================
-
-	token := "input"
-
-	entries := invIndex.Find(token)
-	fmt.Println(token, ":", strings.Join(entries, ", "))
-
-	token = "users"
-
-	entries = invIndex.Find(token)
-	fmt.Println(token, ":", strings.Join(entries, ", "))
-
-	token = "был"
-
-	entries = invIndex.Find(token)
-	fmt.Println(token, ":", strings.Join(entries, ", "))
-
-	// Incidence Matrix
-	inc := Or(incMatrix.Vals("был"), Not(And(incMatrix.Vals("input"), incMatrix.Vals("users"))))
-	entries = IncToDocuments(inc, docNames)
-	fmt.Println("был OR NOT (input AND users):", strings.Join(entries, ", "))
-
-	// Inverted Index
-	ind := Or2(invIndex.Vals("был"), Not2(And2(invIndex.Vals("input"), invIndex.Vals("users")), fullSet))
-	entries = IndToDocuments(ind)
-	fmt.Println("был OR NOT (input AND users):", strings.Join(entries, ", "))
+	CreateInvIndex("./texts")
 }

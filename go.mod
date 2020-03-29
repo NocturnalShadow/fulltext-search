@@ -10,6 +10,7 @@ require (
 	github.com/golang/protobuf v1.3.2 // indirect
 	github.com/jdkato/prose v1.1.1
 	github.com/levigross/exp-html v0.0.0-20120902181939-8df60c69a8f5 // indirect
+	github.com/lunixbochs/struc v0.0.0-20190916212049-a5c72983bc42
 	github.com/mingrammer/commonregex v1.0.1 // indirect
 	github.com/willf/bitset v1.1.10
 	gonum.org/v1/gonum v0.6.2 // indirect
