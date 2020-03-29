@@ -187,7 +187,7 @@ func CreateInvIndex(filesDir string) {
 	// fmt.Printf("%v", recordsBlock)
 
 	// Merge blocks into one index file
-	files, err = filepath.Glob(dir + "/*")
+	files, err = filepath.Glob("index/*")
 	if err != nil {
 		log.Fatal(err)
 	}
